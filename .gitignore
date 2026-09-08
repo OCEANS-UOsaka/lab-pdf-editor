@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+.claude/.cc-writes/
+.claude/settings.local.json
+public/pdfjs/

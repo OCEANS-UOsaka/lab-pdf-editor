@@ -1,0 +1,33 @@
+{
+  "name": "lab-pdf-editor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ブラウザ内で完結する論文 PDF レビュー（コメント）アプリ。コメントは PDF 標準注釈として保存する。",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "predev": "node scripts/copy-pdfjs-assets.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/copy-pdfjs-assets.mjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "sample": "node scripts/make-sample.mjs",
+    "check": "npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "@cantoo/pdf-lib": "^2.9.2",
+    "pdfjs-dist": "^6.3.289"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^5.0.0"
+  }
+}

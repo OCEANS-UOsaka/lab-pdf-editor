@@ -9,6 +9,8 @@ export interface ToolbarActions {
   copyMarkdown(): void;
   saveMarkdown(): void;
   setAuthor(name: string): void;
+  undo(): void;
+  redo(): void;
   setZoom(mode: ZoomMode): void;
   toggleNoteMode(): void;
 }
@@ -29,6 +31,8 @@ export class Toolbar {
   private readonly authorInput: HTMLInputElement;
   private readonly zoomSelect: HTMLSelectElement;
   private readonly noteButton: HTMLButtonElement;
+  private readonly undoButton: HTMLButtonElement;
+  private readonly redoButton: HTMLButtonElement;
   private readonly fileLabel: HTMLSpanElement;
   private readonly docButtons: HTMLButtonElement[] = [];
 
@@ -43,6 +47,8 @@ export class Toolbar {
       <div class="tb-spacer"></div>
       <label class="tb-author">著者名 <input type="text" data-role="author" placeholder="あなたの名前" autocomplete="name" /></label>
       <select class="tb-zoom" data-role="zoom" title="表示倍率"></select>
+      <button type="button" class="tb-btn tb-btn-icon" data-act="undo" data-role="undo" aria-label="元に戻す" title="元に戻す（⌘Z / Ctrl+Z）" disabled>↶</button>
+      <button type="button" class="tb-btn tb-btn-icon" data-act="redo" data-role="redo" aria-label="やり直す" title="やり直す（⇧⌘Z / Ctrl+Y）" disabled>↷</button>
       <button type="button" class="tb-btn tb-toggle" data-act="note" data-doc title="ページをクリックした場所に付箋を置く（N）">付箋</button>
       <button type="button" class="tb-btn" data-act="import" data-doc title="同じ原稿の注釈入り PDF を選んでコメントを統合する">コメントを取り込む</button>
       <details class="tb-menu" data-role="md">
@@ -63,6 +69,8 @@ export class Toolbar {
     this.authorInput = this.query<HTMLInputElement>('[data-role="author"]');
     this.zoomSelect = this.query<HTMLSelectElement>('[data-role="zoom"]');
     this.noteButton = this.query<HTMLButtonElement>('[data-act="note"]');
+    this.undoButton = this.query<HTMLButtonElement>('[data-role="undo"]');
+    this.redoButton = this.query<HTMLButtonElement>('[data-role="redo"]');
     this.fileLabel = this.query<HTMLSpanElement>('[data-role="file"]');
     this.docButtons = Array.from(this.el.querySelectorAll<HTMLButtonElement>('[data-doc]'));
 
@@ -88,6 +96,12 @@ export class Toolbar {
           break;
         case 'note':
           actions.toggleNoteMode();
+          break;
+        case 'undo':
+          actions.undo();
+          break;
+        case 'redo':
+          actions.redo();
           break;
         case 'save':
           actions.savePdf();
@@ -147,6 +161,12 @@ export class Toolbar {
   setNoteMode(on: boolean): void {
     this.noteButton.classList.toggle('is-on', on);
     this.noteButton.setAttribute('aria-pressed', String(on));
+  }
+
+  /** 元に戻す／やり直すの押せる状態（履歴が空なら押せない） */
+  setHistory(canUndo: boolean, canRedo: boolean): void {
+    this.undoButton.toggleAttribute('disabled', !canUndo);
+    this.redoButton.toggleAttribute('disabled', !canRedo);
   }
 
   setZoom(mode: ZoomMode): void {

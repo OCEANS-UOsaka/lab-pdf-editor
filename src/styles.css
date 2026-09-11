@@ -108,6 +108,11 @@ summary.tb-btn[disabled] {
 .tb-btn-quiet {
   border-color: transparent;
 }
+.tb-btn-icon {
+  padding: 5px 9px;
+  font-size: 15px;
+  line-height: 1.1;
+}
 .tb-toggle.is-on {
   background: var(--accent);
   border-color: #e0b400;

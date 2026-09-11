@@ -64,6 +64,8 @@ export function startApp(root: HTMLElement): void {
     setAuthor,
     setZoom: (mode) => viewer.setZoom(mode),
     toggleNoteMode: () => setNoteMode(!noteMode),
+    undo,
+    redo,
   });
 
   const main = document.createElement('div');
@@ -179,8 +181,18 @@ export function startApp(root: HTMLElement): void {
     if (restored > 0) toast(`前回の下書きからコメント ${restored} 件を復元しました`);
   }
 
+  // ---- 元に戻す・やり直す ----
+  function undo(): void {
+    if (!store.undo()) toast('これ以上戻せません');
+  }
+
+  function redo(): void {
+    if (!store.redo()) toast('やり直せる操作はありません');
+  }
+
   // ---- Store の変化を画面へ ----
   store.subscribe((event) => {
+    toolbar.setHistory(store.canUndo, store.canRedo);
     if (event.type === 'comments' || event.type === 'text') scheduleDraftSave();
     if (event.type === 'comments' || event.type === 'selection' || event.type === 'document') {
       viewer.setComments(store.comments, store.selectedId);
@@ -326,6 +338,18 @@ export function startApp(root: HTMLElement): void {
     if (mod && event.key.toLowerCase() === 's') {
       event.preventDefault();
       void savePdf();
+      return;
+    }
+    // 入力欄の中ではブラウザ標準の取り消し（その欄の文字だけ）に任せる
+    if (mod && event.key.toLowerCase() === 'z' && !isTypingTarget(event.target)) {
+      event.preventDefault();
+      if (event.shiftKey) redo();
+      else undo();
+      return;
+    }
+    if (mod && event.key.toLowerCase() === 'y' && !isTypingTarget(event.target)) {
+      event.preventDefault();
+      redo();
       return;
     }
     if (event.key === 'Escape') {

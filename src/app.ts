@@ -4,22 +4,31 @@ import './styles.css';
 import { downloadBytes, downloadText } from './export/download';
 import { markdownFileName, reviewedFileName } from './export/filenames';
 import { toMarkdown } from './export/markdown';
+import { canShareFiles, deliverFile } from './export/share';
 import { mergeComments } from './model/merge';
 import { ReviewStore } from './model/store';
+import type { Comment } from './model/types';
 import { readAnnotations, writeAnnotations } from './pdf/annotations';
 import { sha256Hex } from './pdf/hash';
 import { loadPdfDocument, PdfOpenError, type LoadedPdf } from './pdf/loader';
 import { deleteDraft, loadDraft, saveDraft } from './storage/drafts';
+import { askAuthor } from './ui/AuthorDialog';
+import { CommentSheet } from './ui/CommentSheet';
 import { renderEmptyState } from './ui/EmptyState';
 import { Sidebar } from './ui/Sidebar';
 import { toast } from './ui/toast';
 import { Toolbar } from './ui/Toolbar';
+import { isCompact, isTouchDevice, lastInputWasTouch, onCompactChange, trackVisualViewport } from './ui/viewport';
 import { hitTestHighlight } from './viewer/hittest';
 import { PdfViewer } from './viewer/PdfViewer';
 import { watchTextSelection, type TextSelection } from './viewer/selection';
 
 const AUTHOR_KEY = 'lab-pdf-editor.author';
 const DRAFT_DEBOUNCE_MS = 500;
+/** 指で押したときにハイライトを拾う範囲（CSS px） */
+const TOUCH_HIT_PX = 12;
+/** 指で押したとき、選択が消えた通知のあとも「＋ コメント」を残しておく時間（iOS はタップで選択が先に消える） */
+const SELECTION_HOLD_MS = 400;
 
 interface OpenDocument {
   bytes: Uint8Array;
@@ -53,6 +62,7 @@ export function startApp(root: HTMLElement): void {
   const app = document.createElement('div');
   app.className = 'app';
   root.replaceChildren(app);
+  trackVisualViewport();
 
   const toolbar = new Toolbar(app, {
     openFiles: (files) => void openFile(files[0] as File),
@@ -62,26 +72,49 @@ export function startApp(root: HTMLElement): void {
     copyMarkdown: () => void copyMarkdown(),
     saveMarkdown,
     setAuthor,
-    setZoom: (mode) => viewer.setZoom(mode),
+    editAuthor,
+    setZoom: (mode) => {
+      viewer.setZoom(mode);
+      toolbar.setZoom(viewer.zoom);
+    },
     toggleNoteMode: () => setNoteMode(!noteMode),
+    toggleComments: () => sheet.toggle(),
+    commentSelection: () => commentOnSelection(),
+    cancelSelection: () => clearTextSelection(),
     undo,
     redo,
   });
 
+  // 下部バーの保存の絵: 共有シートで渡せる端末なら「共有」、それ以外は「ダウンロード」
+  toolbar.setSaveIcon(isTouchDevice() && canShareFiles(navigator) ? 'share' : 'download');
+
   const main = document.createElement('div');
   main.className = 'app-main';
-  app.append(main);
+  // 下部バー（スマホ用画面）は .app の 3 段目に来るよう、本文の前に入れておいたものを後ろへ回す
+  app.insertBefore(main, toolbar.bottomEl);
   const viewerWrap = document.createElement('div');
   viewerWrap.className = 'app-viewer';
   main.append(viewerWrap);
 
-  const viewer = new PdfViewer(viewerWrap);
+  const viewer = new PdfViewer(viewerWrap, { touch: isTouchDevice() });
   viewer.el.hidden = true;
+  viewer.setFitEachPage(isCompact());
+  onCompactChange((compact) => viewer.setFitEachPage(compact));
+  viewer.onZoomChange = (mode) => toolbar.setZoom(mode);
   const emptyState = renderEmptyState(viewerWrap, {
     openSample: () => void openSample(),
-    pickFile: () => toolbar.el.querySelector<HTMLInputElement>('[data-role="file-input"]')?.click(),
+    pickFile: () => toolbar.pickFile(),
   });
-  const sidebar = new Sidebar(main, store, { onJump: (c) => viewer.scrollToComment(c) });
+  const sidebar = new Sidebar(main, store, { onJump: (c) => jumpToComment(c) });
+  const sheet = new CommentSheet(app, sidebar.el, toolbar.el);
+  sheet.onChange((state, compact) => toolbar.setCommentsOpen(compact && state !== 'closed'));
+  // 新しいコメントに何も書かずに閉じたら、残したことを知らせて取り消せるようにする
+  sheet.onComposeEnd = (id) => {
+    const c = store.find(id);
+    if (!c || c.text.trim() !== '') return;
+    const message = c.anchor.kind === 'highlight' ? 'ハイライトだけ残しました' : '空の付箋を残しました';
+    toast(message, 'info', 5000, { label: '取り消す', run: () => store.removeComment(id) });
+  };
 
   const selectButton = document.createElement('button');
   selectButton.type = 'button';
@@ -89,6 +122,14 @@ export function startApp(root: HTMLElement): void {
   selectButton.textContent = '＋ コメント';
   selectButton.hidden = true;
   document.body.append(selectButton);
+
+  // 付箋モードの案内（本文の上端）
+  const noteHint = document.createElement('div');
+  noteHint.className = 'pv-note-hint';
+  noteHint.hidden = true;
+  noteHint.innerHTML = `<span><span class="for-mouse">付箋を置く場所をクリック</span><span class="for-touch">付箋を置く場所をタップ</span></span><button type="button" data-act="note-cancel">やめる</button>`;
+  noteHint.querySelector('button')!.addEventListener('click', () => setNoteMode(false));
+  viewerWrap.append(noteHint);
 
   // ---- 著者名 ----
   try {
@@ -108,16 +149,30 @@ export function startApp(root: HTMLElement): void {
     }
   }
 
-  function ensureAuthor(): boolean {
-    if (store.author) return true;
-    const name = window.prompt('あなたの名前を入れてください（コメントの著者として PDF に記録されます）');
-    if (!name || !name.trim()) {
-      toast('著者名を入れるとコメントを付けられます', 'error');
-      toolbar.focusAuthor();
-      return false;
+  /**
+   * 著者名があれば run をすぐ呼ぶ。無ければ尋ね、決まったら run を呼ぶ（ダイアログの「決定」のタップの中で同期的に。
+   * run の中で入力欄にフォーカスしても iOS がキーボードを出せるように）。
+   */
+  function withAuthor(run: () => void): void {
+    if (store.author) {
+      run();
+      return;
     }
-    setAuthor(name);
-    return true;
+    askAuthor({ current: '', message: 'コメントの著者として PDF に記録されます。この端末のブラウザが覚えます。' }, (name) => {
+      if (!name) {
+        toast('著者名を入れるとコメントを付けられます', 'error');
+        return;
+      }
+      setAuthor(name);
+      run();
+    });
+  }
+
+  /** 著者名を変える（入力欄の無い幅では「…」から） */
+  function editAuthor(): void {
+    askAuthor({ current: store.author, message: 'コメントの著者として PDF に記録されます。' }, (name) => {
+      if (name !== null) setAuthor(name);
+    });
   }
 
   // ---- 文書を開く ----
@@ -171,6 +226,7 @@ export function startApp(root: HTMLElement): void {
     current = { bytes, hash, fileName, pdf };
     store.openDocument({ fileName, pageCount: read.pageCount, comments, foreignAnnotations: read.foreignAnnotations });
 
+    app.classList.add('has-doc');
     emptyState.hidden = true;
     viewer.el.hidden = false;
     await viewer.load(pdf.doc);
@@ -193,6 +249,7 @@ export function startApp(root: HTMLElement): void {
   // ---- Store の変化を画面へ ----
   store.subscribe((event) => {
     toolbar.setHistory(store.canUndo, store.canRedo);
+    toolbar.setCommentCount(store.comments.length);
     if (event.type === 'comments' || event.type === 'text') scheduleDraftSave();
     if (event.type === 'comments' || event.type === 'selection' || event.type === 'document') {
       viewer.setComments(store.comments, store.selectedId);
@@ -210,51 +267,147 @@ export function startApp(root: HTMLElement): void {
   }
 
   // ---- 文字選択 → ハイライト ----
+  // マウスで選んだら「＋ コメント」を選択のそばに出す（今まで通り）。指で選んだら選択のそばには出さない
+  // （OS の選択メニューとぶつかる）: スマホ用画面は下部バーを「解除／＋ コメント」に差し替え、iPad 等は本文の下端中央に出す。
+  // iOS は選択の外のボタンをタップすると click の前に選択が消えるので、確定した選択を持っておき、
+  // ボタンを押し始めた時点（pointerdown）の値で作る。選択が消えた通知のあとも少しの間はボタンを残す。
+  let armedSelection: TextSelection | null = null;
+  let hideSelectionTimer = 0;
   watchTextSelection(
     viewer.el,
     (el) => viewer.pageViewFor(el),
     (selection) => {
-      pendingSelection = selection;
-      if (!selection) {
-        selectButton.hidden = true;
+      window.clearTimeout(hideSelectionTimer);
+      if (selection) {
+        pendingSelection = selection;
+        armedSelection = null; // 押しかけてやめた古い選択を、次の押下で使わない
+        showSelectionAction(selection);
         return;
       }
-      const { lastRect } = selection;
-      selectButton.hidden = false;
-      const width = selectButton.offsetWidth || 110;
-      const left = Math.min(lastRect.right + 8, window.innerWidth - width - 8);
-      const top = lastRect.top - 38 >= 0 ? lastRect.top - 38 : lastRect.bottom + 8;
-      selectButton.style.left = `${Math.max(8, left)}px`;
-      selectButton.style.top = `${top}px`;
+      if (!pendingSelection) return;
+      hideSelectionTimer = window.setTimeout(
+        () => {
+          pendingSelection = null;
+          hideSelectionAction();
+        },
+        lastInputWasTouch() ? SELECTION_HOLD_MS : 0,
+      );
     },
   );
-  selectButton.addEventListener('mousedown', (event) => event.preventDefault()); // 押しても選択を消さない
-  selectButton.addEventListener('click', () => {
-    if (!pendingSelection || !ensureAuthor()) return;
-    const c = store.addHighlight(pendingSelection);
-    document.getSelection()?.removeAllRanges();
+
+  function showSelectionAction(selection: TextSelection): void {
+    const touch = lastInputWasTouch();
+    if (touch && sheet.isSheet) {
+      selectButton.hidden = true;
+      toolbar.setSelecting(true);
+      return;
+    }
+    toolbar.setSelecting(false);
+    selectButton.hidden = false;
+    selectButton.classList.toggle('is-docked', touch);
+    if (touch) {
+      selectButton.style.left = '';
+      selectButton.style.top = '';
+      return;
+    }
+    const { lastRect } = selection;
+    const width = selectButton.offsetWidth || 110;
+    const left = Math.min(lastRect.right + 8, window.innerWidth - width - 8);
+    const top = lastRect.top - 38 >= 0 ? lastRect.top - 38 : lastRect.bottom + 8;
+    selectButton.style.left = `${Math.max(8, left)}px`;
+    selectButton.style.top = `${top}px`;
+  }
+
+  function hideSelectionAction(): void {
     selectButton.hidden = true;
-    sidebar.focusComment(c.id);
+    toolbar.setSelecting(false);
+  }
+
+  const armSelection = (): void => {
+    armedSelection = pendingSelection;
+  };
+  selectButton.addEventListener('pointerdown', armSelection);
+  toolbar.bottomEl.addEventListener('pointerdown', (event) => {
+    if ((event.target as Element).closest('[data-act="sel-comment"]')) armSelection();
   });
+  selectButton.addEventListener('mousedown', (event) => event.preventDefault()); // 押しても選択を消さない
+  selectButton.addEventListener('click', () => commentOnSelection());
+
+  /** 選んでいる文字列にハイライトとコメントを付け、入力欄にフォーカスする */
+  function commentOnSelection(): void {
+    const selection = armedSelection ?? pendingSelection;
+    armedSelection = null;
+    if (!selection) return;
+    withAuthor(() => {
+      const c = store.addHighlight(selection);
+      clearTextSelection();
+      openEditor(c.id);
+    });
+  }
+
+  /**
+   * 新しいコメントの入力欄を開く。スマホ用画面ではシートを全高にしてから。
+   * iOS はタップの処理の中で同期的に focus しないとキーボードを出さないので、await を挟まずに呼ぶ。
+   */
+  function openEditor(id: string): void {
+    sheet.beginCompose(id);
+    sidebar.focusComment(id);
+  }
+
+  function clearTextSelection(): void {
+    window.clearTimeout(hideSelectionTimer);
+    pendingSelection = null;
+    armedSelection = null;
+    document.getSelection()?.removeAllRanges();
+    hideSelectionAction();
+  }
 
   // ---- ページ上のクリック: 付箋を置く／ハイライトを選ぶ ----
   viewer.onPageClick = (pageIndex, point) => {
     if (noteMode) {
-      if (!ensureAuthor()) return;
-      const c = store.addNote({ pageIndex, point });
       setNoteMode(false);
-      sidebar.focusComment(c.id);
+      withAuthor(() => openEditor(store.addNote({ pageIndex, point }).id));
       return;
     }
     const sel = document.getSelection();
     if (sel && !sel.isCollapsed) return; // 選択直後のクリックは無視
-    const hit = hitTestHighlight(store.comments, pageIndex, point);
+    // 指は細い行のハイライトに当てにくいので、近くも拾う（PDF の pt に直して渡す）
+    const tolerance = lastInputWasTouch() ? TOUCH_HIT_PX / viewer.scaleOf(pageIndex) : 0;
+    const hit = hitTestHighlight(store.comments, pageIndex, point, tolerance);
     store.select(hit ? hit.id : null);
+    if (hit) revealInList(hit);
   };
-  viewer.onSelectNote = (id) => store.select(id);
+  viewer.onSelectNote = (id) => {
+    store.select(id);
+    const c = store.find(id);
+    if (c) revealInList(c);
+  };
+
+  /** 本文で選んだコメントを一覧に出す。スマホ用画面ではシートを半分で開き、選んだ場所がシートに隠れるなら本文を送る */
+  function revealInList(c: Comment): void {
+    if (!sheet.isSheet) return;
+    sheet.reveal('half');
+    viewer.ensureVisible(c, viewer.el.clientHeight * 0.5);
+  }
+
+  /**
+   * 一覧のカードから本文の場所へ移る。スマホ用画面では全高のシートを半分に下げ、見えている部分の上の方に出す
+   * （横向きのスマホなど半分の段が使えないときは閉じる）
+   */
+  function jumpToComment(c: Comment): void {
+    if (!sheet.isSheet) {
+      viewer.scrollToComment(c);
+      return;
+    }
+    if (sheet.current === 'full') sheet.set(sheet.canHalf ? 'half' : 'closed');
+    viewer.scrollToComment(c, 0.2);
+  }
 
   function setNoteMode(on: boolean): void {
     noteMode = on && current !== null;
+    // スマホ用画面では一覧のシートを閉じて本文を出す（開いたままだと、置きたい場所のタップがシートに吸われる）
+    if (noteMode && sheet.isSheet) sheet.set('closed');
+    noteHint.hidden = !noteMode;
     viewer.el.classList.toggle('note-mode', noteMode);
     toolbar.setNoteMode(noteMode);
   }
@@ -265,9 +418,12 @@ export function startApp(root: HTMLElement): void {
     const name = reviewedFileName(current.fileName);
     try {
       const out = await writeAnnotations(current.bytes, store.doc.comments);
-      downloadBytes(out, name);
+      // スマホ・タブレットは共有シート（Slack やファイルへそのまま渡せる）。デスクトップは今まで通りダウンロード
+      const result = await deliverFile(out, name, 'application/pdf', { preferShare: isTouchDevice(), nav: navigator, download: downloadBytes });
+      if (result === 'cancelled') return; // 共有シートを閉じた: 渡していないので下書きは残す
       await deleteDraft(current.hash).catch(() => undefined);
-      toast(`${name} を保存しました（コメント ${store.doc.comments.length} 件）`);
+      const count = store.doc.comments.length;
+      toast(result === 'shared' ? `${name} を共有しました（コメント ${count} 件）` : `${name} を保存しました（コメント ${count} 件）`);
     } catch (err) {
       toast(`保存に失敗しました: ${errorMessage(err)}`, 'error');
     }
